@@ -4,9 +4,14 @@
 LLM の役割は要約テキスト執筆のみに限定し、取得・日付窓計算・XML 生成・
 検証・剪定といった決定的処理はすべて本スクリプトが担う。
 
+既存 digest の実体は S3（digest_base_url 配下）に置かれ、ローカル digest/ は
+リポジトリ同梱スケルトンでランタイムでは参照しない。cutoff 算出・既存 item 読込は
+すべて S3 公開 URL への HTTP GET で行う。
+
 サブコマンド:
   collect : S3 の元 RSS を取得し、カットオフより新しい投稿を digest_work/input.json に集約
-  render  : digest_work/summaries.json を読み、digest/<slug>.xml へ item を冪等追加・剪定・検証
+  render  : digest_work/summaries.json を読み、digest_out/<slug>.xml へ item を冪等追加・剪定・検証
+  upload  : digest_out/*.xml を presigned PUT URL（token JSON 経由）で S3 へアップロードし検証
 """
 
 import argparse
@@ -25,12 +30,11 @@ from xml.sax.saxutils import escape
 # --- 定数 ---------------------------------------------------------------
 # JST（元フィードは UTC 表記だが、ダイジェストの日付・午前/午後判定は JST 基準）
 JST = timezone(timedelta(hours=9))
-# GitHub Pages の公開ベース URL（channel link / atom:self に使用）
-PAGES_BASE = "https://codet2git.github.io/xops-rss-feed"
 # リポジトリルート（本スクリプトは scripts/ 配下に置かれる前提）
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "digest_config.json")
-DIGEST_DIR = os.path.join(ROOT, "digest")
+# render の出力先（ローカル・配信対象外の中間成果物。実体は upload で S3 へ書き戻す）
+DIGEST_OUT_DIR = os.path.join(ROOT, "digest_out")
 WORK_DIR = os.path.join(ROOT, "digest_work")
 # description 末尾のエンゲージメント表記 [like=N repost=M] を抽出する正規表現
 ENGAGEMENT_RE = re.compile(r"\s*\[like=(\d+)\s+repost=(\d+)\]\s*$")
@@ -74,16 +78,41 @@ def split_engagement(description):
     return text, likes, reposts
 
 
-def latest_digest_pubdate(slug):
-    """既存 digest/<slug>.xml の最新 item pubDate（aware datetime）。無ければ None。"""
-    path = os.path.join(DIGEST_DIR, f"{slug}.xml")
-    if not os.path.exists(path):
+def fetch_digest_xml(base_url, slug):
+    """既存 digest を S3 公開 URL から取得し bytes を返す。404・取得失敗・拒否時は None。
+
+    ランタイムでは digest の実体は S3 にあり、ローカル digest/ は参照しない。
+    初回・404・ネットワーク断・DTD 拒否はいずれも「既存なし」として扱い、
+    stderr に注記して継続する（呼び出し側は cutoff=now-24h / 既存 item 空で処理する）。
+    """
+    url = f"{base_url}/{slug}.xml"
+    try:
+        raw = fetch_feed(url)
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            TimeoutError, OSError) as e:
+        print(f"[note] {slug}: 既存ダイジェスト取得失敗（既存なし扱い）: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
         return None
     try:
-        tree = ET.parse(path)
+        # 信頼できない外部入力なので DTD/ENTITY を拒否（拒否時も既存なし扱いで継続）
+        reject_dtd(raw)
+    except ValueError as e:
+        print(f"[note] {slug}: 既存ダイジェスト拒否（既存なし扱い）: {e}",
+              file=sys.stderr)
+        return None
+    return raw
+
+
+def latest_digest_pubdate(base_url, slug):
+    """既存 digest（S3）の最新 item pubDate（aware datetime）。無ければ None。"""
+    raw = fetch_digest_xml(base_url, slug)
+    if raw is None:
+        return None
+    try:
+        root = ET.fromstring(raw)
     except ET.ParseError:
         return None
-    channel = tree.getroot().find("channel")
+    channel = root.find("channel")
     if channel is None:
         return None
     latest = None
@@ -150,13 +179,14 @@ def parse_source_items(raw_bytes, cutoff):
 def cmd_collect(config):
     """collect: 全フィードを取得しカットオフ以降の投稿を digest_work/input.json に書き出す。"""
     min_posts = config.get("min_posts", 5)
+    base_url = config["digest_base_url"]
     now = datetime.now(JST)
     feeds_out = []
     for feed in config["feeds"]:
         slug = feed["slug"]
         name = feed["name"]
-        # カットオフ = 既存ダイジェストの最新 item pubDate、無ければ now-24h
-        cutoff = latest_digest_pubdate(slug) or (now - timedelta(hours=24))
+        # カットオフ = 既存ダイジェスト（S3）の最新 item pubDate、無ければ now-24h
+        cutoff = latest_digest_pubdate(base_url, slug) or (now - timedelta(hours=24))
         entry = {"slug": slug, "name": name, "skip": False,
                  "reason": None, "post_count": 0, "posts": []}
         try:
@@ -208,9 +238,10 @@ def build_item_xml(item):
     )
 
 
-def build_channel_xml(slug, name, items, last_build_dt):
+def build_channel_xml(slug, name, items, last_build_dt, base_url):
     """channel メタデータ（config 由来）+ items から RSS 2.0 全文文字列を生成する。"""
-    link = f"{PAGES_BASE}/digest/{slug}.xml"
+    # 配信は S3（digest_base_url 配下）。channel link / atom:self も配信先を指す。
+    link = f"{base_url}/{slug}.xml"
     title = f"Xops Digest - {name}"
     description = f"{name} リストのAIトレンドダイジェスト（朝夕2回更新）"
     items_xml = "".join(build_item_xml(it) for it in items)
@@ -230,14 +261,17 @@ def build_channel_xml(slug, name, items, last_build_dt):
     )
 
 
-def read_existing_items(slug):
-    """既存 digest/<slug>.xml の item を dict リストで返す（CDATA は透過的に text 化される）。"""
-    path = os.path.join(DIGEST_DIR, f"{slug}.xml")
+def read_existing_items(base_url, slug):
+    """既存 digest（S3）の item を dict リストで返す（CDATA は透過的に text 化される）。"""
     items = []
-    if not os.path.exists(path):
+    raw = fetch_digest_xml(base_url, slug)
+    if raw is None:
         return items
-    tree = ET.parse(path)
-    channel = tree.getroot().find("channel")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return items
+    channel = root.find("channel")
     if channel is None:
         return items
     for item in channel.findall("item"):
@@ -272,6 +306,7 @@ def cmd_render(config):
         return 1
 
     config_names = {feed["slug"]: feed["name"] for feed in config["feeds"]}
+    base_url = config["digest_base_url"]
     now = datetime.now(JST)
     # guid 用の日付・午前/午後（JST 12 時前=am、以降=pm）
     ampm = "am" if now.hour < 12 else "pm"
@@ -299,14 +334,14 @@ def cmd_render(config):
         new_item = {"guid": guid, "title": title,
                     "pubDate": pubdate_str, "html": html}
 
-        # 既存 item から同一 guid を除去してから新 item を追加（冪等性の担保）
-        items = [it for it in read_existing_items(slug) if it["guid"] != guid]
+        # 既存 item（S3）から同一 guid を除去してから新 item を追加（冪等性の担保）
+        items = [it for it in read_existing_items(base_url, slug) if it["guid"] != guid]
         items.append(new_item)
         # pubDate 降順に並べ、keep_items で剪定（古い item から落ちる）
         items.sort(key=sort_key_pubdate, reverse=True)
         items = items[:keep_items]
 
-        xml_str = build_channel_xml(slug, name, items, now)
+        xml_str = build_channel_xml(slug, name, items, now, base_url)
         # 書き込み前に全文を minidom で検証（失敗時は書かず exit 1）
         try:
             xml.dom.minidom.parseString(xml_str)
@@ -316,26 +351,109 @@ def cmd_render(config):
         rendered.append((slug, xml_str, len(items)))
 
     # 全 slug が検証を通過してから一括書き込み（部分適用を避ける）
+    os.makedirs(DIGEST_OUT_DIR, exist_ok=True)
     for slug, xml_str, count in rendered:
-        path = os.path.join(DIGEST_DIR, f"{slug}.xml")
+        path = os.path.join(DIGEST_OUT_DIR, f"{slug}.xml")
         with open(path, "w", encoding="utf-8") as f:
             f.write(xml_str)
         print(f"[rendered] {slug}: {count} items")
     return 0
 
 
+def cmd_upload(config):
+    """upload: token JSON を取得し digest_out/*.xml を presigned PUT URL へ送り検証する。
+
+    env XOPS_TOKEN_URL から token JSON（Lambda が発行）を GET し、digest_out 内の
+    各 XML を対応する puts[slug] の presigned URL へ PUT。PUT 後に公開 URL を GET し、
+    書き込んだ内容とバイト一致することを検証する。異常系はすべて stderr + exit 1。
+    """
+    base_url = config["digest_base_url"]
+    token_url = os.environ.get("XOPS_TOKEN_URL")
+    if not token_url:
+        print("XOPS_TOKEN_URL が未設定です", file=sys.stderr)
+        return 1
+
+    # token JSON を取得（Lambda が毎 run 発行する presigned PUT URL 集）
+    try:
+        token = json.loads(fetch_feed(token_url))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"token 取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    puts = token.get("puts", {}) if isinstance(token, dict) else {}
+    headers = token.get("headers", {}) if isinstance(token, dict) else {}
+    if not isinstance(puts, dict) or not isinstance(headers, dict):
+        print("token JSON の形式が不正です（puts / headers）", file=sys.stderr)
+        return 1
+
+    # digest_out の XML を列挙（render 出力・配信対象の実体）
+    if not os.path.isdir(DIGEST_OUT_DIR):
+        print("digest_out/ が存在しません（render 未実行）", file=sys.stderr)
+        return 1
+    xml_files = sorted(f for f in os.listdir(DIGEST_OUT_DIR) if f.endswith(".xml"))
+    if not xml_files:
+        print("digest_out/ にアップロード対象の XML がありません", file=sys.stderr)
+        return 1
+
+    uploaded = 0
+    for fname in xml_files:
+        slug = fname[:-len(".xml")]
+        # token に無い slug（summaries 由来でない）のファイルは警告してスキップ
+        if slug not in puts:
+            print(f"警告: token に slug={slug} が無いためスキップ", file=sys.stderr)
+            continue
+        path = os.path.join(DIGEST_OUT_DIR, fname)
+        with open(path, "rb") as f:
+            body = f.read()
+
+        # presigned URL へ PUT（token JSON の headers を署名一致のためそのまま送る）
+        req = urllib.request.Request(puts[slug], data=body, method="PUT",
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                TimeoutError, OSError) as e:
+            print(f"{slug}: PUT 失敗: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+
+        # 公開 URL を GET し、書き込んだ内容とバイト一致を検証（書き戻し確認）
+        try:
+            fetched = fetch_feed(f"{base_url}/{slug}.xml")
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                TimeoutError, OSError) as e:
+            print(f"{slug}: 検証 GET 失敗: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        if fetched != body:
+            print(f"{slug}: 検証不一致（PUT 内容と公開 URL の内容が異なる）",
+                  file=sys.stderr)
+            return 1
+        print(f"[uploaded] {slug}: {len(body)} bytes 検証OK")
+        uploaded += 1
+
+    # 1 件もアップロードできなかった（token に一致 slug 皆無）のは異常
+    if uploaded == 0:
+        print("アップロード対象がありませんでした（token に一致する slug なし）",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
-    """サブコマンド collect / render を振り分けるエントリポイント。"""
+    """サブコマンド collect / render / upload を振り分けるエントリポイント。"""
     parser = argparse.ArgumentParser(description="Xops ダイジェスト生成")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("collect", help="元 RSS を取得し input.json を生成")
     sub.add_parser("render", help="summaries.json から digest XML を生成")
+    sub.add_parser("upload", help="digest_out を presigned PUT URL で S3 へアップロード")
     args = parser.parse_args()
     config = load_config()
     if args.command == "collect":
         return cmd_collect(config)
     if args.command == "render":
         return cmd_render(config)
+    if args.command == "upload":
+        return cmd_upload(config)
     return 1
 
 

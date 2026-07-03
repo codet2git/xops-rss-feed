@@ -1,8 +1,13 @@
 # ROUTINE — AIトレンドダイジェスト生成手順（cloud agent 用）
 
-このリポジトリだけを checkout したゼロコンテキストの状態で、朝夕2回このルーティンを実行する。
+このリポジトリは匿名 clone で入手済みのゼロコンテキスト状態を前提とする。朝夕2回このルーティンを実行する。
 あなた（LLM）の仕事は **要約テキストの執筆のみ**。取得・日付窓計算・XML 生成・検証・剪定は
 すべて `scripts/make_digest.py` が決定的に処理する。手順を逸脱しないこと。
+
+- 既存ダイジェストの実体は **S3**（`digest_config.json` の `digest_base_url` 配下）にある。
+  リポジトリ同梱の `digest/*.xml`（スケルトン）はランタイムでは使わない。
+- AWS 認証情報は持たない。S3 への書き戻しは Lambda が発行する presigned PUT URL 集
+  （token JSON）を使い、手順⑤で行う（URL はプロンプトで与えられる）。
 
 ## 実行手順
 
@@ -86,23 +91,26 @@ python3 scripts/make_digest.py collect
 python3 scripts/make_digest.py render
 ```
 
-- `digest_work/summaries.json` を読み、各 slug の `digest/<slug>.xml` に item を追加する。
+- `digest_work/summaries.json` を読み、各 slug の `digest_out/<slug>.xml` に item を追加する。
+  既存 item は S3（`digest_base_url`）から取得する。ローカル `digest/` は参照しない。
 - 同じ回（同日・同 am/pm）の item は **置換**（冪等）。件数超過は古い順に自動剪定。
 - 生成 XML は書き込み前に検証される。検証失敗や html 空文字なら非ゼロ終了し、ファイルは書き換えない。
 
-### ⑤ コミット & プッシュ
+### ⑤ アップロード（決定的処理・そのまま実行）
 
 ```bash
-git add digest/
-git commit -m "chore(digest): AIトレンドダイジェスト更新"
-git push
+XOPS_TOKEN_URL='<プロンプトで与えられたURL>' python3 scripts/make_digest.py upload
 ```
 
-- **`digest_work/` はコミットしない**（`.gitignore` 済み）。作業用中間ファイルであり配信対象ではない。
-- `digest/*.xml` のみをコミット対象にする。
+- token JSON（presigned PUT URL 集）を取得し、`digest_out/*.xml` を S3 の
+  `public/rss/digest/<slug>.xml` へ PUT する。PUT 後に公開 URL を GET してバイト一致を検証する。
+- **git のコミット・push は不要**（配信は S3 直書きで完結する）。
+- `digest_work/` `digest_out/` はいずれもローカル中間ファイルで配信対象ではない（`.gitignore` 済み）。
+- `XOPS_TOKEN_URL` 未設定・token 取得失敗・PUT 失敗・検証不一致・対象 XML 皆無はいずれも非ゼロ終了する。
 
 ## 異常時の扱い
 
-- **全フィードが `skip=true`** の場合: `summaries.json` を書かず、`render` も実行せず、コミットもしない（何もせず終了）。
+- **全フィードが `skip=true`** の場合: `summaries.json` を書かず、`render`・`upload` も実行せず、何もせず終了する。
 - 一部フィードのみ skip の場合: skip 以外のフィードだけ要約して通常どおり ④⑤ を実行する。
-- `render` が非ゼロ終了した場合: 原因（stderr）を確認し、修正できなければコミットしない。
+- `render` が非ゼロ終了した場合: 原因（stderr）を確認し、修正できなければ `upload` に進まない。
+- `upload` が非ゼロ終了した場合: 原因（stderr）を確認する。S3 へは何も書き込まれていない/検証で弾かれた状態なので、修正のうえ再実行する。

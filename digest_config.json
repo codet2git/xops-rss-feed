@@ -5,6 +5,7 @@
     {"slug": "toshi-trade", "name": "投資・トレード", "url": "https://xops-489889952146.s3.ap-northeast-1.amazonaws.com/public/rss/toshi-trade.xml"},
     {"slug": "business", "name": "ビジネス・起業", "url": "https://xops-489889952146.s3.ap-northeast-1.amazonaws.com/public/rss/business.xml"}
   ],
+  "digest_base_url": "https://xops-489889952146.s3.ap-northeast-1.amazonaws.com/public/rss/digest",
   "keep_items": 14,
   "min_posts": 5
 }

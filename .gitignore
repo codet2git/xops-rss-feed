@@ -1,3 +1,4 @@
 digest_work/
+digest_out/
 .DS_Store
 __pycache__/
