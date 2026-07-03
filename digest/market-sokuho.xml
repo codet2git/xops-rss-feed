@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Xops Digest - Market速報</title>
+    <link>https://codet2git.github.io/xops-rss-feed/digest/market-sokuho.xml</link>
+    <atom:link href="https://codet2git.github.io/xops-rss-feed/digest/market-sokuho.xml" rel="self" type="application/rss+xml"/>
+    <description>Market速報 リストのAIトレンドダイジェスト（朝夕2回更新）</description>
+    <language>ja</language>
+    <lastBuildDate>Fri, 03 Jul 2026 00:00:00 +0900</lastBuildDate>
+  </channel>
+</rss>
